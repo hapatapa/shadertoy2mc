@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>shadertoy2mc — ShaderToy → Minecraft post-effect</title>
+<meta name="description" content="Convert a ShaderToy shader into a Minecraft post-effect resource pack, entirely in your browser. Drop a file or folder, download a pack." />
+<style>
+  :root {
+    --bg: #0b0713;
+    --panel: rgba(18, 12, 30, 0.72);
+    --panel-solid: #140d22;
+    --ink: #f4eefb;
+    --muted: #a99fc0;
+    --faint: #6f6690;
+    --line: rgba(255, 255, 255, 0.10);
+    --line-strong: rgba(255, 255, 255, 0.18);
+    --coral: #ff5d6c;
+    --amber: #ffb020;
+    --ok: #57e0a8;
+    --warn: #ffcf5c;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: var(--sans);
+    color: var(--ink);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    min-height: 100%;
+  }
+
+  /* The page IS the shader: full-viewport canvas is the ambient hero, and it
+     becomes the uploaded shader once one is loaded. */
+  #stage {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  /* Scrim keeps text legible over whatever the shader is doing. */
+  #scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    background:
+      radial-gradient(120% 90% at 50% -10%, transparent 30%, rgba(6, 4, 12, 0.55) 100%),
+      linear-gradient(180deg, rgba(6, 4, 12, 0.35) 0%, rgba(6, 4, 12, 0.72) 60%, rgba(6, 4, 12, 0.88) 100%);
+  }
+
+  main {
+    position: relative;
+    z-index: 2;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: clamp(28px, 6vh, 72px) 20px 64px;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 18px;
+  }
+  .eyebrow .arrow { color: var(--coral); }
+
+  h1 {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: clamp(30px, 6.5vw, 52px);
+    line-height: 1.02;
+    letter-spacing: -0.02em;
+    margin: 0 0 16px;
+  }
+  h1 .grad {
+    background: linear-gradient(96deg, var(--coral), var(--amber));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .lede {
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--muted);
+    max-width: 54ch;
+    margin: 0 0 32px;
+  }
+  .lede code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    color: var(--ink);
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 6px;
+    border-radius: 5px;
+  }
+
+  .panel {
+    background: var(--panel);
+    backdrop-filter: blur(18px) saturate(1.2);
+    -webkit-backdrop-filter: blur(18px) saturate(1.2);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: 0 24px 60px -30px rgba(0, 0, 0, 0.8);
+  }
+
+  /* ---- Dropzone: a shader "viewport" ---- */
+  #drop {
+    position: relative;
+    display: block;
+    width: 100%;
+    padding: 40px 24px;
+    border: 1.5px dashed var(--line-strong);
+    border-radius: 14px;
+    background: rgba(10, 7, 18, 0.55);
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease;
+    overflow: hidden;
+  }
+  #drop:hover { border-color: rgba(255, 176, 32, 0.55); }
+  #drop:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
+  #drop.drag {
+    border-style: solid;
+    border-color: var(--coral);
+    background: rgba(255, 93, 108, 0.10);
+    transform: scale(1.006);
+  }
+  /* mono corner ticks, like a scope readout */
+  #drop::before,
+  #drop::after {
+    content: "";
+    position: absolute;
+    width: 14px; height: 14px;
+    border: 1.5px solid var(--line-strong);
+  }
+  #drop::before { top: 10px; left: 10px; border-right: 0; border-bottom: 0; }
+  #drop::after { bottom: 10px; right: 10px; border-left: 0; border-top: 0; }
+
+  .drop-glyph {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    color: var(--amber);
+    margin-bottom: 10px;
+  }
+  .drop-title { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
+  .drop-sub { font-size: 13px; color: var(--muted); }
+  .drop-sub b { color: var(--ink); font-weight: 600; }
+
+  .drop-actions {
+    margin-top: 18px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  .ghost-btn {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--ink);
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    padding: 8px 14px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .ghost-btn:hover { background: rgba(255, 255, 255, 0.10); border-color: var(--coral); }
+  .ghost-btn:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  /* ---- Options ---- */
+  .options {
+    margin-top: 16px;
+    padding: 18px 20px;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 14px 18px;
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field.wide { grid-column: 1 / -1; }
+  .field label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .field input {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--ink);
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 11px;
+  }
+  .field input:focus { outline: none; border-color: var(--amber); }
+  .field .hint { font-size: 11px; color: var(--faint); }
+
+  /* ---- Report / terminal ---- */
+  #report {
+    margin-top: 16px;
+    padding: 0;
+    overflow: hidden;
+  }
+  #report[hidden] { display: none; }
+  .report-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line);
+    flex-wrap: wrap;
+  }
+  .report-title {
+    font-family: var(--mono);
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+
+  .download {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #1a0e05;
+    background: linear-gradient(96deg, var(--coral), var(--amber));
+    border: 0;
+    border-radius: 9px;
+    padding: 10px 18px;
+    cursor: pointer;
+    transition: filter 0.15s ease, transform 0.1s ease;
+  }
+  .download:hover { filter: brightness(1.06); }
+  .download:active { transform: translateY(1px); }
+  .download:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  .report-body {
+    padding: 16px 18px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--muted);
+    overflow-x: auto;
+  }
+  .report-body table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+  .report-body th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--faint);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 0 18px 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .report-body td { padding: 6px 18px 6px 0; color: var(--ink); vertical-align: top; }
+  .report-body td.arrow { color: var(--amber); }
+  .file-list { margin: 12px 0 0; color: var(--faint); }
+  .file-list div::before { content: "› "; color: var(--coral); }
+
+  .warnings { margin: 14px 0 0; padding: 14px 16px; border-radius: 10px; background: rgba(255, 207, 92, 0.06); border: 1px solid rgba(255, 207, 92, 0.22); }
+  .warnings h3 { font-family: var(--mono); font-size: 12px; margin: 0 0 8px; color: var(--warn); letter-spacing: 0.06em; }
+  .warnings ul { margin: 0; padding-left: 18px; }
+  .warnings li { margin-bottom: 6px; color: #e9dcc2; }
+  .enable { margin-top: 14px; color: var(--ink); }
+  .enable code { color: var(--amber); }
+
+  #err {
+    margin-top: 16px;
+    padding: 14px 16px;
+    border-radius: 10px;
+    background: rgba(255, 93, 108, 0.10);
+    border: 1px solid rgba(255, 93, 108, 0.35);
+    color: #ffd7db;
+    font-size: 13.5px;
+  }
+  #err[hidden] { display: none; }
+  #err code { font-family: var(--mono); }
+
+  .preview-note {
+    margin-top: 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--faint);
+    text-align: center;
+  }
+
+  footer {
+    position: relative;
+    z-index: 2;
+    text-align: center;
+    padding: 8px 20px 40px;
+    color: var(--faint);
+    font-size: 12.5px;
+    font-family: var(--mono);
+  }
+  footer a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--line-strong); }
+  footer a:hover { color: var(--ink); }
+
+  @media (max-width: 560px) {
+    .options { grid-template-columns: 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #drop, .download { transition: none; }
+  }
+</style>
+</head>
+<body>
+  <canvas id="stage" aria-hidden="true"></canvas>
+  <div id="scrim" aria-hidden="true"></div>
+
+  <main>
+    <p class="eyebrow">ShaderToy <span class="arrow">→</span> Minecraft</p>
+    <h1>Turn a ShaderToy into a <span class="grad">Minecraft post-effect</span>.</h1>
+    <p class="lede">
+      Drop your shader tabs and get a ready-to-use resource pack. It wraps your GLSL in a
+      ShaderToy compatibility shim and emits the <code>post_effect</code> JSON and <code>.fsh</code>
+      passes for Minecraft 26.3-snapshot-3+. Everything runs in your browser — nothing is uploaded.
+    </p>
+
+    <div
+      id="drop"
+      class="panel"
+      role="button"
+      tabindex="0"
+      aria-label="Upload shader files or a folder">
+      <div class="drop-glyph">// mainImage( out vec4 fragColor, in vec2 fragCoord )</div>
+      <div class="drop-title">Drop a shader file or folder here</div>
+      <div class="drop-sub">
+        A single <b>Image</b> tab, or a folder with <b>Common</b>, <b>Buffer&nbsp;A–D</b> and an
+        optional <b>bindings.json</b>.
+      </div>
+      <div class="drop-actions">
+        <button type="button" class="ghost-btn" id="pick-files">Choose file(s)</button>
+        <button type="button" class="ghost-btn" id="pick-dir">Choose folder</button>
+      </div>
+      <input id="file-input" type="file" multiple accept=".txt,.glsl,.frag,.fsh,.fs,.json" hidden />
+      <input id="dir-input" type="file" webkitdirectory hidden />
+    </div>
+    <div class="preview-note" id="preview-note" hidden></div>
+
+    <div class="panel options" aria-label="Conversion options">
+      <div class="field">
+        <label for="opt-name">Effect name</label>
+        <input id="opt-name" type="text" spellcheck="false" placeholder="auto (from file/folder)" />
+        <span class="hint">Used for <code>/post-effect &lt;name&gt;</code> and filenames.</span>
+      </div>
+      <div class="field">
+        <label for="opt-namespace">Namespace</label>
+        <input id="opt-namespace" type="text" spellcheck="false" value="minecraft" />
+        <span class="hint">Asset namespace for outputs.</span>
+      </div>
+      <div class="field wide">
+        <label for="opt-timescale">Time scale (seconds per GameTime cycle)</label>
+        <input id="opt-timescale" type="number" min="1" step="1" value="1200" />
+        <span class="hint">Higher = slower animation. GameTime wraps every ~20&nbsp;min in game.</span>
+      </div>
+    </div>
+
+    <div id="err" hidden></div>
+
+    <div id="report" class="panel" hidden>
+      <div class="report-head">
+        <div class="report-title"><span class="dot" id="status-dot"></span><span id="report-name"></span></div>
+        <button class="download" id="download" type="button">Download resource pack ↓</button>
+      </div>
+      <div class="report-body" id="report-body"></div>
+    </div>
+  </main>
+
+  <footer>
+    client-side · zero upload · <a href="https://github.com" id="repo-link" target="_blank" rel="noopener">shadertoy2mc</a>
+  </footer>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

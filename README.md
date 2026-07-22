@@ -1,7 +1,13 @@
 # shadertoy2mc
 
-Converts a ShaderToy shader into a Minecraft **post-effect** (Java, 1.21.9+ / 26.x
-post-effect pipeline). Zero dependencies, single file, Node 16+.
+Converts a ShaderToy shader into a Minecraft **post-effect** (Java, the
+`post_effect` pipeline introduced in **26.3-snapshot-3**). Zero dependencies, Node 16+.
+
+Use it two ways — both run the exact same conversion (`core.mjs`):
+
+- **CLI** — `node shadertoy2mc.mjs <inputDir> [options]` (writes into a pack root)
+- **Web** — open `index.html`; drop a file or folder, download a `.zip` resource pack.
+  Everything runs client-side, so it hosts as static files (e.g. Cloudflare Pages).
 
 ```bash
 node shadertoy2mc.mjs <inputDir> [options]
@@ -46,6 +52,23 @@ assets/<ns>/shaders/post/<name>_a.fsh         (Buffer A) …
 ```
 
 Then in game: `/post-effect <name>`.
+
+## Web app
+
+`index.html` + `app.js` + `core.mjs` + `zip.js` are a complete static site — no build
+step, no dependencies, nothing uploaded. Drop a single shader file (treated as the
+**Image** tab) or a whole folder (with `Common`, `Buffer A–D`, `bindings.json`) and it
+returns a ready-to-drop-in `.zip` resource pack, including a generated `pack.mcmeta`.
+
+The page also compiles your **Image** tab into a live WebGL background using the same
+shim technique the pack uses, so you get a preview before you download. Multi-pass or
+channel-sampling shaders can't be previewed live (they still convert fine).
+
+**Deploy on Cloudflare Pages** (or any static host): point it at the repo root with no
+build command. `.mjs`/`.js` are served as ES modules; there's nothing to compile.
+
+> `pack.mcmeta` is written with `min_format`/`max_format` `[92, 0]` (26.3-snapshot-3+).
+> On a different snapshot, edit those in the downloaded `pack.mcmeta`.
 
 ## Channel bindings
 
