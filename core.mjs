@@ -209,16 +209,21 @@ export function convert(tabs, opts = {}) {
   };
 
   // --- post_effect JSON generation
-  const targetJsonName = (passKey) => (passKey === "image" ? namespace + ":main" : bufTarget(passKey));
+  // The main screen framebuffer is a built-in target and is ALWAYS
+  // "minecraft:main", regardless of the pack's asset namespace. Namespacing it
+  // (e.g. "sugoroku:main") points at a target that doesn't exist, so the whole
+  // post chain fails to load.
+  const MAIN = "minecraft:main";
+  const targetJsonName = (passKey) => (passKey === "image" ? MAIN : bufTarget(passKey));
 
   const inputsForPass = (passKey) => {
     const chans = usedChannels[passKey];
     if (chans.length === 0) {
-      return [{ sampler_name: "In", target: namespace + ":main" }];
+      return [{ sampler_name: "In", target: MAIN }];
     }
     return chans.map((n) => {
       const t = bindings[passKey][n];
-      const target = t === "main" ? namespace + ":main" : t === "unbound" ? namespace + ":main" : t;
+      const target = t === "main" ? MAIN : t === "unbound" ? MAIN : t;
       return { sampler_name: `iChan${n}`, target };
     });
   };
