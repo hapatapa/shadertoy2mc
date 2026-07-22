@@ -13,6 +13,8 @@ Use it two ways — both run the exact same conversion (`core.mjs`):
 node shadertoy2mc.mjs <inputDir> [options]
 ```
 
+<img width="720" height="913" alt="screenshot" src="https://github.com/user-attachments/assets/93852ae6-efda-46ba-911b-cb359f76c9e9" />
+
 ## How it works
 
 It does **not** parse GLSL. It emits a ShaderToy compatibility shim (`iResolution`,
