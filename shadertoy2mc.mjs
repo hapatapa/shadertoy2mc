@@ -20,6 +20,10 @@
 //   --time-scale <n>    Seconds that GameTime's 0..1 cycle maps to (default: 1200)
 //   --bindings <file>   JSON mapping iChannels -> targets (see README). If a
 //                       bindings.json exists in <inputDir> it is used by default.
+//   --cookie <string>   Cookie string for ShaderToy (bypasses Cloudflare).
+//                       Get cf_clearance from your browser's DevTools → Application
+//                       → Cookies for shadertoy.com, then pass the full Cookie
+//                       header value, e.g. "cf_clearance=abc...".
 //   --dry-run           Print what would be written without touching disk.
 //
 // Input can be:
@@ -55,7 +59,7 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 if (args._.length === 0) {
-  console.error("usage: node shadertoy2mc.mjs <inputDir|shadertoyUrl|shaderId> [--out dir] [--name n] [--namespace ns] [--time-scale 1200] [--bindings file] [--dry-run]");
+  console.error("usage: node shadertoy2mc.mjs <inputDir|shadertoyUrl|shaderId> [--out dir] [--name n] [--namespace ns] [--time-scale 1200] [--bindings file] [--cookie str] [--dry-run]");
   process.exit(1);
 }
 
@@ -71,7 +75,7 @@ const SHADERTOY_ID_RE = /^[A-Za-z0-9]{4,10}$/;
 const SHADERTOY_URL_RE = /shadertoy\.com\/(?:view|new)\/([A-Za-z0-9]+)/i;
 
 function extractShaderId(input) {
-  // Bare ID like "Ms2SD1"
+  // Bare ID like "Ms2SD1" — only if no local path matches
   if (SHADERTOY_ID_RE.test(input) && !fs.existsSync(input)) {
     return input;
   }
@@ -90,10 +94,21 @@ const isUrl = shaderId !== null;
 function fetchShaderToy(id) {
   return new Promise((resolve, reject) => {
     const url = `https://www.shadertoy.com/api/v1/shaders/${id}`;
-    https.get(url, (res) => {
+    const headers = {
+      "User-Agent": "shadertoy2mc/1.0",
+      Accept: "application/json",
+    };
+    if (args.cookie) {
+      headers["Cookie"] = args.cookie;
+    }
+    https.get(url, { headers }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        // Follow redirects
         return fetchShaderToy(res.headers.location).then(resolve, reject);
+      }
+      if (res.statusCode === 403) {
+        res.resume();
+        reject(new Error("cf_403"));
+        return;
       }
       if (res.statusCode !== 200) {
         res.resume();
@@ -192,7 +207,25 @@ async function main() {
     try {
       shader = await fetchShaderToy(shaderId);
     } catch (e) {
-      console.error(`error: ${e.message}`);
+      if (e.message === "cf_403") {
+        process.stderr.write("blocked by Cloudflare\n");
+        console.error(`
+error: ShaderToy returned 403 (Cloudflare block).
+
+Options:
+  1. Pass your browser cookie with --cookie:
+     Open shadertoy.com in your browser → DevTools (F12) →
+     Application → Cookies → copy the cf_clearance value, then:
+       node shadertoy2mc.mjs ${shaderId} --cookie "cf_clearance=<value>"
+
+  2. Save the shader locally and use the directory path:
+     Save each tab (Image, Common, Buffer A-D) as .txt files in a
+     folder, then point the tool at that folder.
+`);
+      } else {
+        process.stderr.write("failed\n");
+        console.error(`error: ${e.message}`);
+      }
       process.exit(1);
     }
     process.stderr.write("ok\n");
