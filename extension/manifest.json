@@ -1,16 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "shadertoy2mc Bridge",
+  "name": "shadertoy2mc",
   "version": "1.0.0",
-  "description": "Send ShaderToy shaders to the shadertoy2mc companion server for Minecraft resource pack conversion.",
+  "description": "Download any ShaderToy shader as a Minecraft post-effect resource pack ZIP.",
   "permissions": [
     "activeTab",
-    "scripting"
+    "downloads"
   ],
   "host_permissions": [
     "https://www.shadertoy.com/*"
   ],
   "background": {
+    "type": "module",
     "scripts": ["background.js"]
   },
   "action": {

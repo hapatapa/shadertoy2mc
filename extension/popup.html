@@ -5,7 +5,7 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      width: 340px;
+      width: 320px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 13px;
       background: #1a1a2e;
@@ -15,33 +15,26 @@
     h1 {
       font-size: 15px;
       font-weight: 700;
-      margin-bottom: 10px;
+      margin-bottom: 12px;
       display: flex;
       align-items: center;
       gap: 8px;
       color: #fff;
     }
     h1 svg { flex-shrink: 0; }
-    .status-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
+    .info-row {
+      font-size: 12px;
+      color: #aaa;
       margin-bottom: 10px;
       padding: 6px 8px;
       border-radius: 6px;
       background: rgba(255,255,255,0.05);
     }
-    .dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      background: #555;
-      flex-shrink: 0;
+    .info-row .id {
+      color: #e94560;
+      font-family: monospace;
+      font-weight: 600;
     }
-    .dot.ok { background: #4caf50; }
-    .dot.err { background: #f44336; }
-    .dot.loading { background: #ff9800; animation: pulse 0.8s infinite; }
-    @keyframes pulse { 50% { opacity: 0.4; } }
     label {
       display: block;
       font-size: 11px;
@@ -80,12 +73,12 @@
       transition: background 0.15s, opacity 0.15s;
       font-family: inherit;
     }
-    .btn-convert {
+    .btn-download {
       background: #e94560;
       color: #fff;
     }
-    .btn-convert:hover { background: #c73e55; }
-    .btn-convert:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-download:hover { background: #c73e55; }
+    .btn-download:disabled { opacity: 0.4; cursor: not-allowed; }
     #result {
       margin-top: 10px;
       padding: 0;
@@ -129,24 +122,16 @@
       color: #ff9800;
       line-height: 1.4;
       margin-top: 2px;
-      padding-left: 10px;
+      padding-left: 14px;
       position: relative;
     }
     .warn-item::before { content: "⚠"; position: absolute; left: 0; }
-    .server-row {
-      display: flex;
-      gap: 6px;
-      align-items: end;
+    .no-shader {
+      text-align: center;
+      color: #666;
+      font-size: 12px;
+      padding: 20px 0;
     }
-    .server-row input { flex: 1; }
-    .server-row button {
-      width: auto;
-      padding: 7px 12px;
-      background: #0f3460;
-      color: #e0e0e0;
-      white-space: nowrap;
-    }
-    .server-row button:hover { background: #1a4a7a; }
   </style>
 </head>
 <body>
@@ -157,39 +142,29 @@
       <path d="M6 14l4-10 4 10" stroke="#e94560" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
       <path d="M7.5 11h5" stroke="#e94560" stroke-width="1.5" stroke-linecap="round"/>
     </svg>
-    shadertoy2mc Bridge
+    shadertoy2mc
   </h1>
 
-  <div class="status-row">
-    <span class="dot" id="serverDot"></span>
-    <span id="serverStatus">Checking server...</span>
+  <div class="info-row" id="shaderInfo">
+    <span class="no-shader">Navigate to a ShaderToy shader page</span>
   </div>
 
-  <label>Server URL</label>
-  <div class="server-row">
-    <input type="text" id="serverUrl" value="http://localhost:3141" placeholder="http://localhost:3141">
-    <button id="btnSaveServer">Save</button>
-  </div>
-
-  <label>Shader</label>
-  <input type="text" id="shaderId" readonly placeholder="Open a ShaderToy page...">
-
-  <div class="options">
-    <div>
-      <label>Namespace</label>
-      <select id="optNamespace">
-        <option value="" selected>minecraft</option>
-      </select>
+  <div id="optionsPane" style="display:none">
+    <div class="options">
+      <div>
+        <label>Namespace</label>
+        <input type="text" id="optNamespace" value="minecraft" placeholder="minecraft">
+      </div>
+      <div>
+        <label>Time Scale (s)</label>
+        <input type="number" id="optTimeScale" value="1200" min="1">
+      </div>
     </div>
-    <div>
-      <label>Time Scale (s)</label>
-      <input type="number" id="optTimeScale" value="1200" min="1">
-    </div>
-  </div>
 
-  <button class="btn-convert" id="btnConvert" disabled>
-    Send to shadertoy2mc
-  </button>
+    <button class="btn-download" id="btnDownload" disabled>
+      Download Resource Pack ZIP
+    </button>
+  </div>
 
   <div id="result"></div>
 

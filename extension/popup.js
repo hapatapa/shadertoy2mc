@@ -1,141 +1,89 @@
-// shadertoy2mc bridge — popup UI logic.
+// shadertoy2mc — popup UI.
 
-const $serverDot = document.getElementById("serverDot");
-const $serverStatus = document.getElementById("serverStatus");
-const $serverUrl = document.getElementById("serverUrl");
-const $shaderId = document.getElementById("shaderId");
+const $shaderInfo = document.getElementById("shaderInfo");
+const $optionsPane = document.getElementById("optionsPane");
 const $optNamespace = document.getElementById("optNamespace");
 const $optTimeScale = document.getElementById("optTimeScale");
-const $btnConvert = document.getElementById("btnConvert");
-const $btnSaveServer = document.getElementById("btnSaveServer");
+const $btnDownload = document.getElementById("btnDownload");
 const $result = document.getElementById("result");
 
-// ---- Server status ----
-async function checkServer() {
-  $serverDot.className = "dot loading";
-  $serverStatus.textContent = "Checking server...";
-  try {
-    const resp = await browser.runtime.sendMessage({ type: "check-server" });
-    if (resp.ok) {
-      $serverDot.className = "dot ok";
-      $serverStatus.textContent = `Server connected (v${resp.status?.version || "?"})`;
-      updateConvertButton();
-    } else {
-      throw new Error();
-    }
-  } catch {
-    $serverDot.className = "dot err";
-    $serverStatus.textContent = "Server not running — start: node server.mjs";
-    $btnConvert.disabled = true;
-  }
-}
+let currentShaderId = null;
 
-// ---- Get shader ID from current tab ----
+// ---- Detect shader on current tab ----
 async function detectShader() {
   try {
     const resp = await browser.runtime.sendMessage({ type: "get-shader-id" });
-    const id = resp.shaderId;
-    if (id) {
-      $shaderId.value = id;
-      updateConvertButton();
+    currentShaderId = resp.shaderId;
+    if (currentShaderId) {
+      $shaderInfo.innerHTML = `Shader: <span class="id">${escapeHtml(currentShaderId)}</span>`;
+      $optionsPane.style.display = "";
+      $btnDownload.disabled = false;
     } else {
-      $shaderId.value = "";
-      $shaderId.placeholder = "Not on a ShaderToy shader page";
-      $btnConvert.disabled = true;
+      $shaderInfo.innerHTML = `<span class="no-shader">Navigate to a ShaderToy shader page</span>`;
+      $optionsPane.style.display = "none";
+      $btnDownload.disabled = true;
     }
   } catch {
-    $shaderId.placeholder = "Could not detect shader";
-    $btnConvert.disabled = true;
+    $shaderInfo.innerHTML = `<span class="no-shader">Could not detect shader</span>`;
+    $optionsPane.style.display = "none";
+    $btnDownload.disabled = true;
   }
 }
 
-function updateConvertButton() {
-  const hasShader = $shaderId.value.length > 0;
-  const serverOk = $serverDot.classList.contains("ok");
-  $btnConvert.disabled = !(hasShader && serverOk);
-}
+// ---- Download ----
+$btnDownload.addEventListener("click", async () => {
+  if (!currentShaderId) return;
 
-// ---- Save server URL ----
-$btnSaveServer.addEventListener("click", async () => {
-  const url = $serverUrl.value.replace(/\/+$/, "");
-  await browser.runtime.sendMessage({ type: "update-server-url", serverUrl: url });
- $btnSaveServer.textContent = "Saved";
-  setTimeout(() => ($btnSaveServer.textContent = "Save"), 1000);
-  checkServer();
-});
-
-// ---- Convert ----
-$btnConvert.addEventListener("click", async () => {
-  const shaderId = $shaderId.value.trim();
-  if (!shaderId) return;
-
-  $btnConvert.disabled = true;
-  $btnConvert.textContent = "Fetching from ShaderToy...";
+  $btnDownload.disabled = true;
+  $btnDownload.textContent = "Fetching...";
   $result.className = "";
-  $result.textContent = "";
+  $result.innerHTML = "";
 
   try {
-    const options = {
-      namespace: $optNamespace.value || undefined,
-      timeScale: Number($optTimeScale.value) || 1200,
-    };
-
     const resp = await browser.runtime.sendMessage({
-      type: "fetch-and-convert",
-      shaderId,
-      options,
+      type: "fetch-convert-download",
+      shaderId: currentShaderId,
+      options: {
+        namespace: $optNamespace.value || undefined,
+        timeScale: Number($optTimeScale.value) || 1200,
+      },
     });
 
-    if (!resp.ok) {
-      throw new Error(resp.error || "Unknown error");
-    }
+    if (!resp.ok) throw new Error(resp.error || "Unknown error");
 
-    // Success
     $result.className = "show ok";
-    let html = `<div class="result-title">${resp.effectName}</div>`;
+    let html = `<div class="result-title">${escapeHtml(resp.effectName)}.zip downloaded</div>`;
     html += `<div class="result-detail">`;
-    html += `Shader: ${resp.shaderName || shaderId}\n`;
+    html += `Shader: ${escapeHtml(resp.shaderName || currentShaderId)}\n`;
     html += `Tabs: ${resp.tabs?.join(", ") || "—"}\n`;
     html += `Passes: ${resp.passes}\n`;
-    html += `Output: ${resp.outRoot}\n`;
     html += `</div>`;
-    html += `<div class="cmd">/post-effect ${resp.effectName}</div>`;
+    html += `<div class="cmd">/post-effect ${escapeHtml(resp.effectName)}</div>`;
+
+    if (resp.files?.length) {
+      html += `<div class="result-detail" style="margin-top:8px;">Files:\n`;
+      for (const f of resp.files) html += `  ${escapeHtml(f)}\n`;
+      html += `</div>`;
+    }
 
     if (resp.warnings?.length) {
       html += `<div class="warn-list">`;
-      for (const w of resp.warnings) {
-        html += `<div class="warn-item">${escapeHtml(w)}</div>`;
-      }
+      for (const w of resp.warnings) html += `<div class="warn-item">${escapeHtml(w)}</div>`;
       html += `</div>`;
     }
 
     $result.innerHTML = html;
-
-    // Show file list
-    if (resp.files?.length) {
-      let filesHtml = `<div class="result-detail" style="margin-top:8px;">Files:\n`;
-      for (const f of resp.files) filesHtml += `  ${f}\n`;
-      filesHtml += `</div>`;
-      $result.innerHTML += filesHtml;
-    }
-
   } catch (e) {
     $result.className = "show err";
     $result.innerHTML = `<div class="result-title">Error</div><div class="result-detail">${escapeHtml(e.message)}</div>`;
   }
 
-  $btnConvert.textContent = "Send to shadertoy2mc";
-  $btnConvert.disabled = false;
+  $btnDownload.textContent = "Download Resource Pack ZIP";
+  $btnDownload.disabled = false;
 });
 
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// ---- Init ----
-(async () => {
-  const { serverUrl } = await browser.runtime.sendMessage({ type: "get-server-url" });
-  if (serverUrl) $serverUrl.value = serverUrl;
-  await checkServer();
-  await detectShader();
-})();
+detectShader();

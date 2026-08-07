@@ -1,15 +1,11 @@
-// shadertoy2mc bridge — background service worker.
+// shadertoy2mc — background service worker.
 //
 // Fetches the ShaderToy API from the browser context (bypasses Cloudflare),
-// then POSTs the shader JSON to the local companion server.
+// runs the conversion pipeline inline (core.mjs), zips the result (zip.js),
+// and triggers a download. No server needed.
 
-const DEFAULT_SERVER = "http://localhost:3141";
-
-// ---- Get server URL from storage ----
-async function getServerUrl() {
-  const { serverUrl } = await browser.storage.local.get("serverUrl");
-  return (serverUrl || DEFAULT_SERVER).replace(/\/+$/, "");
-}
+import { convert } from "./core.mjs";
+import { zipBlob } from "./zip.js";
 
 // ---- Extract shader ID from a tab URL ----
 function extractShaderId(tabUrl) {
@@ -30,104 +26,92 @@ async function fetchShaderFromAPI(shaderId) {
   return data.Shader;
 }
 
-// ---- Extract shader source from the page itself (fallback) ----
-// ShaderToy loads the source into a global variable. We can grab it from the page.
-async function fetchShaderFromPage(tabId) {
-  const results = await browser.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      // ShaderToy stores compiled/rendered shader data globally.
-      // The page has a function getShaderData() or similar, but the
-      // most reliable approach is to read from the Shadertoy React state.
-      //
-      // Try the global gShaderData first, then fall back to the
-      // visible source editor.
-      if (window.gShaderData) {
-        return window.gShaderData;
-      }
-      // Try the React internal state
-      const root = document.getElementById("root") || document.getElementById("app");
-      if (root && root._reactRootContainer) {
-        // React 16
-        const fiber = root._reactRootContainer?._internalRoot?.current;
-        // This is fragile, prefer the API approach
-      }
-      // Try parsing from page HTML — ShaderToy embeds shader info in a
-      // <script> tag or as data attributes.
-      //
-      // Last resort: return null to signal we need the API.
-      return null;
-    },
-  });
-  return results?.[0]?.result || null;
+// ---- Parse ShaderToy API response into tabs ----
+function tabsFromShaderToy(shader) {
+  const tabs = {};
+  for (const pass of shader.renderpass) {
+    const name = (pass.name || "").trim();
+    const type = (pass.type || "").toLowerCase();
+    const code = pass.code || "";
+    if (type === "common" || name.toLowerCase() === "common") {
+      tabs.common = code;
+    } else if (type === "image" || name.toLowerCase() === "image") {
+      tabs.image = code;
+    } else if (type === "buffer" || type === "cfm") {
+      const letter = name.replace(/\s*buffer\s*/i, "").trim().toLowerCase();
+      if (/^[a-d]$/.test(letter)) tabs[letter] = code;
+    }
+  }
+  return { tabs, shaderName: shader.info?.name || null };
 }
 
-// ---- Send to companion server ----
-async function sendToServer(shader, options = {}) {
-  const serverUrl = await getServerUrl();
-  const resp = await fetch(`${serverUrl}/convert`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ shader, options }),
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ error: `Server returned ${resp.status}` }));
-    throw new Error(err.error || `Server error ${resp.status}`);
-  }
-  return await resp.json();
-}
+// ---- Main: fetch → convert → zip → download ----
+async function fetchConvertDownload(shaderId, options = {}) {
+  const shader = await fetchShaderFromAPI(shaderId);
+  const { tabs, shaderName } = tabsFromShaderToy(shader);
 
-// ---- Check if server is alive ----
-async function checkServer() {
-  const serverUrl = await getServerUrl();
-  try {
-    const resp = await fetch(`${serverUrl}/status`, { signal: AbortSignal.timeout(3000) });
-    if (resp.ok) return await resp.json();
-    return null;
-  } catch {
-    return null;
+  if (!tabs.image) {
+    throw new Error("Shader has no Image pass");
   }
+
+  const enc = new TextEncoder();
+  const result = convert(tabs, {
+    name: options.name || undefined,
+    defaultName: shaderName || shaderId,
+    namespace: options.namespace || undefined,
+    timeScale: options.timeScale || 1200,
+    bindings: null,
+  });
+
+  const zipEntries = result.outputs.map((o) => ({
+    name: o.path,
+    data: enc.encode(o.content),
+  }));
+
+  const blob = zipBlob(zipEntries);
+  const filename = `${result.effectName}.zip`;
+
+  const url = URL.createObjectURL(blob);
+  await browser.downloads.download({
+    url,
+    filename,
+    saveAs: true,
+  });
+  // Revoke after a delay so the download can start
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+
+  return {
+    effectName: result.effectName,
+    shaderName,
+    tabs: Object.keys(tabs).map((k) =>
+      k === "image" ? "Image" : k === "common" ? "Common" : "Buffer " + k.toUpperCase()
+    ),
+    passes: result.passKeys.length,
+    files: result.outputs.map((o) => o.path),
+    warnings: result.warnings,
+    enableCommand: `/post-effect ${result.effectName}`,
+  };
 }
 
 // ---- Handle messages from popup ----
-browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === "check-server") {
-    checkServer().then((status) => sendResponse({ ok: !!status, status }));
-    return true; // async
-  }
-
+browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "get-shader-id") {
-    // Use the active tab to get the URL
     browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
-      const id = extractShaderId(tabs[0]?.url || "");
-      sendResponse({ shaderId: id });
+      sendResponse({ shaderId: extractShaderId(tabs[0]?.url || "") });
     });
     return true;
   }
 
-  if (message.type === "fetch-and-convert") {
+  if (message.type === "fetch-convert-download") {
     const { shaderId, options } = message;
     (async () => {
       try {
-        // Fetch shader from API (browser context bypasses Cloudflare)
-        const shader = await fetchShaderFromAPI(shaderId);
-        const result = await sendToServer(shader, options);
+        const result = await fetchConvertDownload(shaderId, options);
         sendResponse({ ok: true, ...result });
       } catch (e) {
         sendResponse({ ok: false, error: e.message });
       }
     })();
-    return true; // async
-  }
-
-  if (message.type === "update-server-url") {
-    browser.storage.local.set({ serverUrl: message.serverUrl });
-    sendResponse({ ok: true });
-    return true;
-  }
-
-  if (message.type === "get-server-url") {
-    getServerUrl().then((url) => sendResponse({ serverUrl: url }));
     return true;
   }
 });
