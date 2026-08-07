@@ -95,8 +95,13 @@ function fetchShaderToy(id) {
   return new Promise((resolve, reject) => {
     const url = `https://www.shadertoy.com/api/v1/shaders/${id}`;
     const headers = {
-      "User-Agent": "shadertoy2mc/1.0",
-      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+      Accept: "application/json, text/plain, */*",
+      "Accept-Language": "en-US,en;q=0.9",
+      Referer: `https://www.shadertoy.com/view/${id}`,
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-origin",
     };
     if (args.cookie) {
       headers["Cookie"] = args.cookie;
@@ -107,6 +112,7 @@ function fetchShaderToy(id) {
       }
       if (res.statusCode === 403) {
         res.resume();
+        // Collect response body for debugging
         reject(new Error("cf_403"));
         return;
       }

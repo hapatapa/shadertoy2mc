@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 340px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 14px;
+    }
+    h1 {
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #fff;
+    }
+    h1 svg { flex-shrink: 0; }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      margin-bottom: 10px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.05);
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #555;
+      flex-shrink: 0;
+    }
+    .dot.ok { background: #4caf50; }
+    .dot.err { background: #f44336; }
+    .dot.loading { background: #ff9800; animation: pulse 0.8s infinite; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+    label {
+      display: block;
+      font-size: 11px;
+      color: #aaa;
+      margin-bottom: 3px;
+      margin-top: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    input, select {
+      width: 100%;
+      padding: 7px 9px;
+      border: 1px solid #333;
+      border-radius: 5px;
+      background: #16213e;
+      color: #e0e0e0;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: #e94560; }
+    .options {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px 10px;
+      margin: 10px 0;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+      font-family: inherit;
+    }
+    .btn-convert {
+      background: #e94560;
+      color: #fff;
+    }
+    .btn-convert:hover { background: #c73e55; }
+    .btn-convert:disabled { opacity: 0.4; cursor: not-allowed; }
+    #result {
+      margin-top: 10px;
+      padding: 0;
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.3s, padding 0.3s;
+      border-radius: 6px;
+    }
+    #result.show {
+      max-height: 500px;
+      padding: 10px;
+      overflow-y: auto;
+    }
+    #result.ok { background: rgba(76, 175, 80, 0.12); border: 1px solid rgba(76, 175, 80, 0.3); }
+    #result.err { background: rgba(244, 67, 54, 0.12); border: 1px solid rgba(244, 67, 54, 0.3); }
+    .result-title {
+      font-weight: 700;
+      font-size: 13px;
+      margin-bottom: 4px;
+      color: #fff;
+    }
+    .result-detail {
+      font-size: 11px;
+      color: #ccc;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .cmd {
+      background: #0f3460;
+      padding: 5px 8px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #4caf50;
+      margin-top: 6px;
+    }
+    .warn-list { margin-top: 4px; }
+    .warn-item {
+      font-size: 11px;
+      color: #ff9800;
+      line-height: 1.4;
+      margin-top: 2px;
+      padding-left: 10px;
+      position: relative;
+    }
+    .warn-item::before { content: "⚠"; position: absolute; left: 0; }
+    .server-row {
+      display: flex;
+      gap: 6px;
+      align-items: end;
+    }
+    .server-row input { flex: 1; }
+    .server-row button {
+      width: auto;
+      padding: 7px 12px;
+      background: #0f3460;
+      color: #e0e0e0;
+      white-space: nowrap;
+    }
+    .server-row button:hover { background: #1a4a7a; }
+  </style>
+</head>
+<body>
+
+  <h1>
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+      <rect x="1" y="1" width="18" height="18" rx="3" stroke="#e94560" stroke-width="1.5"/>
+      <path d="M6 14l4-10 4 10" stroke="#e94560" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M7.5 11h5" stroke="#e94560" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    shadertoy2mc Bridge
+  </h1>
+
+  <div class="status-row">
+    <span class="dot" id="serverDot"></span>
+    <span id="serverStatus">Checking server...</span>
+  </div>
+
+  <label>Server URL</label>
+  <div class="server-row">
+    <input type="text" id="serverUrl" value="http://localhost:3141" placeholder="http://localhost:3141">
+    <button id="btnSaveServer">Save</button>
+  </div>
+
+  <label>Shader</label>
+  <input type="text" id="shaderId" readonly placeholder="Open a ShaderToy page...">
+
+  <div class="options">
+    <div>
+      <label>Namespace</label>
+      <select id="optNamespace">
+        <option value="" selected>minecraft</option>
+      </select>
+    </div>
+    <div>
+      <label>Time Scale (s)</label>
+      <input type="number" id="optTimeScale" value="1200" min="1">
+    </div>
+  </div>
+
+  <button class="btn-convert" id="btnConvert" disabled>
+    Send to shadertoy2mc
+  </button>
+
+  <div id="result"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

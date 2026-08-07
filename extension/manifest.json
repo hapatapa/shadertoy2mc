@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "shadertoy2mc Bridge",
+  "version": "1.0.0",
+  "description": "Send ShaderToy shaders to the shadertoy2mc companion server for Minecraft resource pack conversion.",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.shadertoy.com/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icons/icon-48.png",
+      "96": "icons/icon-96.png"
+    }
+  },
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png"
+  }
+}
