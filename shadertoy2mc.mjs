@@ -11,26 +11,29 @@
 // generated files into a resource-pack root.
 //
 // Usage:
-//   node shadertoy2mc.mjs <inputDir> [options]
+//   node shadertoy2mc.mjs <inputDir|shadertoyUrl|shaderId> [options]
 //
 // Options:
 //   --out <dir>         Resource-pack root to write into (default: ".")
-//   --name <name>       Effect name (default: sanitized input dir name)
+//   --name <name>       Effect name (default: sanitized dir name or ShaderToy title)
 //   --namespace <ns>    Asset namespace (default: "minecraft")
 //   --time-scale <n>    Seconds that GameTime's 0..1 cycle maps to (default: 1200)
 //   --bindings <file>   JSON mapping iChannels -> targets (see README). If a
 //                       bindings.json exists in <inputDir> it is used by default.
 //   --dry-run           Print what would be written without touching disk.
 //
-// Input dir should contain tab files named like ShaderToy tabs:
-//   Image.txt (required), Common.txt, Buffer A.txt .. Buffer D.txt
+// Input can be:
+//   - A directory of tab files (Image.txt, Common.txt, Buffer A.txt .. D.txt)
+//   - A ShaderToy URL (e.g. https://shadertoy.com/view/Ms2SD1)
+//   - A bare ShaderToy shader ID (e.g. Ms2SD1)
 //   (extensions .txt/.glsl/.frag/.fsh/.fs are all accepted)
 //
 // No external dependencies. Node 16+.
 
 import fs from "node:fs";
 import path from "node:path";
-import { convert, classifyTab, hasAcceptedExt } from "./core.mjs";
+import https from "node:https";
+import { convert, classifyTab, hasAcceptedExt, sanitizeName } from "./core.mjs";
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -52,14 +55,92 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 if (args._.length === 0) {
-  console.error("usage: node shadertoy2mc.mjs <inputDir> [--out dir] [--name n] [--namespace ns] [--time-scale 1200] [--bindings file] [--dry-run]");
+  console.error("usage: node shadertoy2mc.mjs <inputDir|shadertoyUrl|shaderId> [--out dir] [--name n] [--namespace ns] [--time-scale 1200] [--bindings file] [--dry-run]");
   process.exit(1);
 }
 
-const inputDir = args._[0];
+const input = args._[0];
 const outRoot = args.out || ".";
 const timeScale = Number(args["time-scale"] || 1200);
 const dryRun = !!args.dryRun;
+
+// ---------------------------------------------------------------------------
+// ShaderToy URL / ID detection
+// ---------------------------------------------------------------------------
+const SHADERTOY_ID_RE = /^[A-Za-z0-9]{4,10}$/;
+const SHADERTOY_URL_RE = /shadertoy\.com\/(?:view|new)\/([A-Za-z0-9]+)/i;
+
+function extractShaderId(input) {
+  // Bare ID like "Ms2SD1"
+  if (SHADERTOY_ID_RE.test(input) && !fs.existsSync(input)) {
+    return input;
+  }
+  // URL like https://shadertoy.com/view/Ms2SD1
+  const m = input.match(SHADERTOY_URL_RE);
+  if (m) return m[1];
+  return null;
+}
+
+const shaderId = extractShaderId(input);
+const isUrl = shaderId !== null;
+
+// ---------------------------------------------------------------------------
+// Fetch shader from ShaderToy API
+// ---------------------------------------------------------------------------
+function fetchShaderToy(id) {
+  return new Promise((resolve, reject) => {
+    const url = `https://www.shadertoy.com/api/v1/shaders/${id}`;
+    https.get(url, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        // Follow redirects
+        return fetchShaderToy(res.headers.location).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`ShaderToy API returned ${res.statusCode} for shader "${id}"`));
+        return;
+      }
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(body);
+          if (!json.Shader) {
+            reject(new Error(`ShaderToy API returned unexpected response for shader "${id}"`));
+            return;
+          }
+          resolve(json.Shader);
+        } catch (e) {
+          reject(new Error(`Failed to parse ShaderToy API response for shader "${id}": ${e.message}`));
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+function tabsFromShaderToy(shader) {
+  const tabs = {};
+
+  for (const pass of shader.renderpass) {
+    const name = (pass.name || "").trim();
+    const type = (pass.type || "").toLowerCase();
+    const code = pass.code || "";
+
+    if (type === "common" || name.toLowerCase() === "common") {
+      tabs.common = code;
+    } else if (type === "image" || name.toLowerCase() === "image") {
+      tabs.image = code;
+    } else if (type === "buffer" || type === "cfm") {
+      // "Buffer A" -> "a", "Buffer B" -> "b", etc.
+      const letter = name.replace(/\s*buffer\s*/i, "").trim().toLowerCase();
+      if (/^[a-d]$/.test(letter)) {
+        tabs[letter] = code;
+      }
+    }
+  }
+
+  return { tabs, shaderName: shader.info?.name || null };
+}
 
 // ---------------------------------------------------------------------------
 // Read tabs off disk
@@ -82,9 +163,9 @@ function readTabs(dir) {
   return tabs;
 }
 
-function loadBindings() {
-  const explicitPath = args.bindings || path.join(inputDir, "bindings.json");
-  if (fs.existsSync(explicitPath)) {
+function loadBindings(inputDir) {
+  const explicitPath = args.bindings || (inputDir && path.join(inputDir, "bindings.json"));
+  if (explicitPath && fs.existsSync(explicitPath)) {
     try {
       return JSON.parse(fs.readFileSync(explicitPath, "utf8"));
     } catch (e) {
@@ -95,66 +176,97 @@ function loadBindings() {
   return null;
 }
 
-const tabs = readTabs(inputDir);
-if (!tabs.image) {
-  console.error(`error: no "Image" tab found in ${inputDir} (need Image.txt / Image.glsl / ...)`);
-  process.exit(1);
-}
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+async function main() {
+  let tabs;
+  let defaultName;
+  let inputLabel;
 
-// ---------------------------------------------------------------------------
-// Convert
-// ---------------------------------------------------------------------------
-let result;
-try {
-  result = convert(tabs, {
-    name: args.name,
-    defaultName: path.basename(path.resolve(inputDir)),
-    namespace: args.namespace,
-    timeScale,
-    bindings: loadBindings(),
-  });
-} catch (e) {
-  console.error(`error: ${e.message}`);
-  process.exit(1);
-}
-
-const { effectName, passKeys, buffers, common, warnings, outputs, passReport } = result;
-
-// ---------------------------------------------------------------------------
-// Emit
-// ---------------------------------------------------------------------------
-if (dryRun) {
-  for (const o of outputs) {
-    console.log(`\n===== ${o.path} =====`);
-    console.log(o.content);
+  if (isUrl) {
+    // ---- ShaderToy URL / ID path ----
+    inputLabel = `shadertoy:${shaderId}`;
+    process.stderr.write(`Fetching shader ${shaderId} from ShaderToy... `);
+    let shader;
+    try {
+      shader = await fetchShaderToy(shaderId);
+    } catch (e) {
+      console.error(`error: ${e.message}`);
+      process.exit(1);
+    }
+    process.stderr.write("ok\n");
+    const parsed = tabsFromShaderToy(shader);
+    tabs = parsed.tabs;
+    defaultName = parsed.shaderName || shaderId;
+    if (!tabs.image) {
+      console.error(`error: shader "${shaderId}" has no Image pass`);
+      process.exit(1);
+    }
+    const tabList = Object.keys(tabs).map((k) => k === "image" ? "Image" : k === "common" ? "Common" : "Buffer " + k.toUpperCase());
+    process.stderr.write(`  tabs: ${tabList.join(", ")}\n`);
+  } else {
+    // ---- Local directory path ----
+    inputLabel = input;
+    tabs = readTabs(input);
+    defaultName = path.basename(path.resolve(input));
+    if (!tabs.image) {
+      console.error(`error: no "Image" tab found in ${input} (need Image.txt / Image.glsl / ...)`);
+      process.exit(1);
+    }
   }
-} else {
-  for (const o of outputs) {
-    const full = path.join(outRoot, o.path);
-    fs.mkdirSync(path.dirname(full), { recursive: true });
-    fs.writeFileSync(full, o.content);
+
+  // Convert
+  let result;
+  try {
+    result = convert(tabs, {
+      name: args.name,
+      defaultName,
+      namespace: args.namespace,
+      timeScale,
+      bindings: loadBindings(isUrl ? null : input),
+    });
+  } catch (e) {
+    console.error(`error: ${e.message}`);
+    process.exit(1);
+  }
+
+  const { effectName, passKeys, buffers, common, warnings, outputs, passReport } = result;
+
+  // Emit
+  if (dryRun) {
+    for (const o of outputs) {
+      console.log(`\n===== ${o.path} =====`);
+      console.log(o.content);
+    }
+  } else {
+    for (const o of outputs) {
+      const full = path.join(outRoot, o.path);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, o.content);
+    }
+  }
+
+  // Report
+  console.log(`\nshadertoy2mc: "${effectName}"  (${passKeys.length} pass${passKeys.length > 1 ? "es" : ""})`);
+  console.log(`  input:  ${inputLabel}`);
+  console.log(`  tabs:   ${["common", ...buffers.map((b) => "Buffer " + b.toUpperCase()), "Image"].filter((t) => t !== "common" || common).join(", ")}`);
+  console.log("  passes:");
+  for (const p of passReport) {
+    console.log(`    ${p.label.padEnd(9)} -> ${p.output.padEnd(14)}  [${p.inputs.join(", ")}]`);
+  }
+  console.log("  files:");
+  for (const o of outputs) console.log(`    ${dryRun ? "(dry) " : ""}${path.join(outRoot, o.path)}`);
+
+  if (warnings.length) {
+    console.log(`\n  ⚠ ${warnings.length} warning${warnings.length > 1 ? "s" : ""}:`);
+    for (const w of warnings) console.log(`    - ${w}`);
+    console.log("\n  Note: Minecraft post targets are 8-bit RGBA (0..1). Buffers that store");
+    console.log("  data outside that range (distances, positions, HDR) will band or clip.");
+    console.log("  Enable in-game with:  /post-effect " + effectName);
+  } else {
+    console.log(`\n  ✔ no warnings. Enable in-game with:  /post-effect ${effectName}`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Report
-// ---------------------------------------------------------------------------
-console.log(`\nshadertoy2mc: "${effectName}"  (${passKeys.length} pass${passKeys.length > 1 ? "es" : ""})`);
-console.log(`  input:  ${inputDir}`);
-console.log(`  tabs:   ${["common", ...buffers.map((b) => "Buffer " + b.toUpperCase()), "Image"].filter((t) => t !== "common" || common).join(", ")}`);
-console.log("  passes:");
-for (const p of passReport) {
-  console.log(`    ${p.label.padEnd(9)} -> ${p.output.padEnd(14)}  [${p.inputs.join(", ")}]`);
-}
-console.log("  files:");
-for (const o of outputs) console.log(`    ${dryRun ? "(dry) " : ""}${path.join(outRoot, o.path)}`);
-
-if (warnings.length) {
-  console.log(`\n  ⚠ ${warnings.length} warning${warnings.length > 1 ? "s" : ""}:`);
-  for (const w of warnings) console.log(`    - ${w}`);
-  console.log("\n  Note: Minecraft post targets are 8-bit RGBA (0..1). Buffers that store");
-  console.log("  data outside that range (distances, positions, HDR) will band or clip.");
-  console.log("  Enable in-game with:  /post-effect " + effectName);
-} else {
-  console.log(`\n  ✔ no warnings. Enable in-game with:  /post-effect ${effectName}`);
-}
+main();
