@@ -9,7 +9,6 @@ const $result = document.getElementById("result");
 
 let currentShaderId = null;
 
-// ---- Detect shader on current tab ----
 async function detectShader() {
   try {
     const resp = await browser.runtime.sendMessage({ type: "get-shader-id" });
@@ -30,19 +29,17 @@ async function detectShader() {
   }
 }
 
-// ---- Download ----
 $btnDownload.addEventListener("click", async () => {
   if (!currentShaderId) return;
 
   $btnDownload.disabled = true;
-  $btnDownload.textContent = "Fetching...";
+  $btnDownload.textContent = "Reading shader...";
   $result.className = "";
   $result.innerHTML = "";
 
   try {
     const resp = await browser.runtime.sendMessage({
-      type: "fetch-convert-download",
-      shaderId: currentShaderId,
+      type: "download-from-page",
       options: {
         namespace: $optNamespace.value || undefined,
         timeScale: Number($optTimeScale.value) || 1200,
