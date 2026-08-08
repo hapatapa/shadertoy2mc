@@ -157,13 +157,12 @@ export function convert(tabs, opts = {}) {
     lines.push("");
     lines.push("#include <minecraft:globals.glsl>");
     lines.push("");
-    if (chans.length > 0) {
-      for (const n of chans) {
-        lines.push(`uniform sampler2D iChan${n}Sampler;`);
-        lines.push(`#define iChannel${n} iChan${n}Sampler`);
-      }
-    } else {
-      lines.push("uniform sampler2D InSampler; // unused; keeps the pass valid");
+    // Always declare all 4 iChannel samplers — ShaderToy always provides them
+    // (bound to black if unused). This avoids missed-channel bugs where a shader
+    // references a channel via macro/indirection that our regex can't detect.
+    for (let n = 0; n < 4; n++) {
+      lines.push(`uniform sampler2D iChan${n}Sampler;`);
+      lines.push(`#define iChannel${n} iChan${n}Sampler`);
     }
     lines.push("");
     lines.push("layout(location = 0) in vec2 texCoord;");
@@ -218,15 +217,15 @@ export function convert(tabs, opts = {}) {
   const targetJsonName = (passKey) => (passKey === "image" ? MAIN : bufTarget(passKey));
 
   const inputsForPass = (passKey) => {
-    const chans = usedChannels[passKey];
-    if (chans.length === 0) {
-      return [{ sampler_name: "In", target: MAIN }];
+    // Always include all 4 iChannel inputs (matches the always-declared uniforms).
+    // Detected channels get their correct target; undetected ones get MAIN.
+    const inputs = [];
+    for (let n = 0; n < 4; n++) {
+      const t = bindings[passKey]?.[n];
+      const target = t === "main" ? MAIN : t === "unbound" ? MAIN : (t || MAIN);
+      inputs.push({ sampler_name: `iChan${n}`, target });
     }
-    return chans.map((n) => {
-      const t = bindings[passKey][n];
-      const target = t === "main" ? MAIN : t === "unbound" ? MAIN : t;
-      return { sampler_name: `iChan${n}`, target };
-    });
+    return inputs;
   };
 
   const genPostEffectJson = () => {
