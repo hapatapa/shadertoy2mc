@@ -113,7 +113,8 @@ function genShader(opts) {
   lines.push("");
   lines.push("#include <minecraft:globals.glsl>");
   lines.push("");
-  lines.push("uniform sampler2D InSampler;");
+  lines.push("uniform sampler2D iChan0Sampler;");
+  lines.push("#define iChannel0 iChan0Sampler");
   lines.push("");
   lines.push("layout(location = 0) in vec2 texCoord;");
   lines.push("layout(location = 0) out vec4 fragColor;");
@@ -174,14 +175,14 @@ function genShader(opts) {
   if (blendMode === "replace") {
     lines.push("    fragColor = vec4(videoColor, 1.0);");
   } else if (blendMode === "overlay") {
-    lines.push("    vec3 screen = texture(InSampler, texCoord).rgb;");
+    lines.push("    vec3 screen = texture(iChannel0, texCoord).rgb;");
     lines.push("    vec3 blended = screen * videoColor + screen * (1.0 - videoColor) * 2.0 * videoColor;");
     lines.push("    fragColor = vec4(clamp(blended, 0.0, 1.0), 1.0);");
   } else if (blendMode === "multiply") {
-    lines.push("    vec3 screen = texture(InSampler, texCoord).rgb;");
+    lines.push("    vec3 screen = texture(iChannel0, texCoord).rgb;");
   lines.push("    fragColor = vec4(screen * videoColor, 1.0);");
   } else if (blendMode === "add") {
-    lines.push("    vec3 screen = texture(InSampler, texCoord).rgb;");
+    lines.push("    vec3 screen = texture(iChannel0, texCoord).rgb;");
     lines.push("    fragColor = vec4(clamp(screen + videoColor, 0.0, 1.0), 1.0);");
   } else {
     lines.push("    fragColor = vec4(videoColor, 1.0);");
@@ -198,7 +199,7 @@ function genPostEffectJson(effectName, namespace) {
     passes: [{
       vertex_shader: "minecraft:core/screenquad",
       fragment_shader: namespace + ":post/" + effectName,
-      inputs: [{ sampler_name: "In", target: "minecraft:main" }],
+      inputs: [{ sampler_name: "iChan0", target: "minecraft:main" }],
       output: "minecraft:main",
     }],
   };
