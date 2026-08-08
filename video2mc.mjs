@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 // video2mc — convert a video into a Minecraft 26.3+ post-effect that loops.
 //
-// Stores all video frames in a texture atlas (PNG) and generates a GLSL shader
-// that samples from it based on GameTime. No SPIR-V constant pool limits.
+// Embeds every frame's pixels as packed RGB floats in a const float[] array
+// inside the shader. The shader indexes into the array based on GameTime.
+//
+// SPIR-V has hard limits on constant pool size, so the tool auto-scales
+// resolution and frame count to fit within --max-pixels (default 100000).
+// Post effects cannot bind custom textures, so const arrays are the only option.
 //
 // Usage:
 //   node video2mc.mjs <video> [options]
@@ -18,7 +22,7 @@
 //   --time-scale <n>    Multiplier for GameTime (default: 1.0)
 //   --loop <s>          Loop period in GameTime-scaled seconds (default: video duration)
 //   --blend <mode>      Blend mode: replace | overlay | multiply | add (default: replace)
-//   --smooth            Use linear filtering instead of nearest-neighbor
+//   --max-pixels <n>    Max total pixels across all frames (default: 100000)
 //   --dry-run           Print stats without writing files
 //
 // Requires: ffmpeg on PATH (system package, e.g. `apt install ffmpeg`)
@@ -26,7 +30,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import zlib from "node:zlib";
 
 // ---- Helpers ----
 function sanitizeName(s) {
@@ -42,59 +45,13 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a.startsWith("--")) {
       const key = a.slice(2);
-      if (key === "dry-run" || key === "smooth") args[key] = true;
+      if (key === "dry-run") args.dryRun = true;
       else args[key] = argv[++i];
     } else {
       args._.push(a);
     }
   }
   return args;
-}
-
-// ---- Minimal PNG encoder (zero dependencies, uses node:zlib) ----
-function crc32(buf) {
-  let crc = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    crc ^= buf[i];
-    for (let j = 0; j < 8; j++) {
-      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
-    }
-  }
-  return (~crc) >>> 0;
-}
-
-function pngChunk(type, data) {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length, 0);
-  const typeB = Buffer.from(type, "ascii");
-  const crcB = Buffer.alloc(4);
-  crcB.writeUInt32BE(crc32(Buffer.concat([typeB, data])), 0);
-  return Buffer.concat([len, typeB, data, crcB]);
-}
-
-function encodePNG(width, height, rgba) {
-  // rgba: Uint8Array of length width * height * 4
-  const stride = 1 + width * 4; // 1 filter byte + RGBA pixels
-  const raw = Buffer.alloc(height * stride);
-  for (let y = 0; y < height; y++) {
-    const si = y * width * 4;
-    const di = y * stride;
-    raw[di] = 0; // filter: None
-    raw.set(rgba.subarray(si, si + width * 4), di + 1);
-  }
-  const compressed = zlib.deflateSync(raw, { level: 9 });
-  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // color type: RGBA
-  return Buffer.concat([
-    sig,
-    pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", compressed),
-    pngChunk("IEND", Buffer.alloc(0)),
-  ]);
 }
 
 // ---- Get video info via ffprobe ----
@@ -110,11 +67,7 @@ function ffprobe(file) {
     proc.on("error", reject);
     proc.on("close", (code) => {
       if (code !== 0) return reject(new Error("ffprobe exited " + code));
-      try {
-        resolve(JSON.parse(out));
-      } catch (e) {
-        reject(e);
-      }
+      try { resolve(JSON.parse(out)); } catch (e) { reject(e); }
     });
   });
 }
@@ -123,14 +76,10 @@ function ffprobe(file) {
 function extractFrames(file, opts) {
   return new Promise((resolve, reject) => {
     const args = [
-      "-i",
-      file,
-      "-vf",
-      "scale=" + opts.width + ":" + opts.height + ",fps=" + opts.fps,
-      "-pix_fmt",
-      "rgb24",
-      "-f",
-      "rawvideo",
+      "-i", file,
+      "-vf", "scale=" + opts.width + ":" + opts.height + ",fps=" + opts.fps,
+      "-pix_fmt", "rgb24",
+      "-f", "rawvideo",
     ];
     if (opts.duration) args.push("-t", String(opts.duration));
     args.push("pipe:1");
@@ -150,120 +99,130 @@ function extractFrames(file, opts) {
   });
 }
 
-// ---- Build texture atlas from raw frames ----
-function buildAtlas(raw, frameW, frameH, frameCount) {
-  const ATLAS_MAX = 4096;
-  const cols = Math.min(frameCount, Math.floor(ATLAS_MAX / frameW));
-  const rows = Math.ceil(frameCount / cols);
-  const atlasW = cols * frameW;
-  const atlasH = rows * frameH;
-  const atlas = new Uint8Array(atlasW * atlasH * 4); // RGBA, zero-initialized
+// ---- Pack RGB bytes into a float (3 bytes -> 1 float) ----
+function packRGB(r, g, b) {
+  return r * 65536 + g * 256 + b;
+}
 
-  for (let f = 0; f < frameCount; f++) {
-    const col = f % cols;
-    const row = Math.floor(f / cols);
-    const frameStart = f * frameW * frameH * 3;
+// ---- Auto-scale resolution and frame count to fit maxPixels ----
+function autoScale(srcWidth, srcHeight, srcDuration, fps, maxPixels) {
+  let width = srcWidth;
+  let height = srcHeight;
+  let duration = srcDuration;
+  let frameCount = Math.ceil(duration * fps);
+  let totalPixels = width * height * frameCount;
+  const minDim = 4; // don't go below 4x4
+  const warnings = [];
 
-    for (let y = 0; y < frameH; y++) {
-      for (let x = 0; x < frameW; x++) {
-        const si = frameStart + (y * frameW + x) * 3;
-        const di = ((row * frameH + y) * atlasW + col * frameW + x) * 4;
-        atlas[di] = raw[si]; // R
-        atlas[di + 1] = raw[si + 1]; // G
-        atlas[di + 2] = raw[si + 2]; // B
-        atlas[di + 3] = 255; // A
-      }
-    }
+  if (totalPixels <= maxPixels) return { width, height, duration, frameCount, totalPixels, warnings };
+
+  // Phase 1: reduce resolution while keeping all frames
+  const aspect = srcHeight / srcWidth;
+  let bestW = width;
+  let bestH = height;
+  for (let w = srcWidth; w >= minDim; w -= 2) {
+    const h = Math.max(minDim, Math.round(aspect * w) & ~1);
+    const px = w * h * frameCount;
+    if (px <= maxPixels) { bestW = w; bestH = h; break; }
+  }
+  if (bestW * bestH * frameCount <= maxPixels) {
+    width = bestW; height = bestH;
+    totalPixels = width * height * frameCount;
+    warnings.push("Resolution reduced to " + width + "x" + height + " to fit SPIR-V constant limit");
+    return { width, height, duration, frameCount, totalPixels, warnings };
   }
 
-  return { atlas, atlasW, atlasH, cols, rows };
+  // Phase 2: at minimum resolution, reduce frame count
+  width = minDim;
+  height = Math.max(minDim, Math.round(aspect * minDim) & ~1);
+  const maxFrames = Math.floor(maxPixels / (width * height));
+  if (maxFrames < 1) {
+    process.stderr.write("error: video too large even at " + width + "x" + height + " (need at least 1 frame, max " + maxPixels + " pixels)\n");
+    process.exit(1);
+  }
+  frameCount = maxFrames;
+  duration = frameCount / fps;
+  totalPixels = width * height * frameCount;
+  warnings.push("Resolution reduced to " + width + "x" + height + " and duration truncated to " + duration.toFixed(1) + "s (" + frameCount + " frames) to fit SPIR-V constant limit");
+  return { width, height, duration, frameCount, totalPixels, warnings };
 }
 
 // ---- Generate GLSL shader ----
 function genShader(opts) {
-  const {
-    width: fw,
-    height: fh,
-    frameCount,
-    fps,
-    loopDuration,
-    timeScale,
-    blendMode,
-    atlasW,
-    atlasH,
-    cols,
-    rows,
-  } = opts;
+  const { width, height, frameCount, fps, loopDuration, timeScale, blendMode, frameData } = opts;
+  const totalPixels = width * height * frameCount;
   const lines = [];
 
   lines.push("#version 330");
   lines.push("#extension GL_ARB_separate_shader_objects : require");
   lines.push("");
-  lines.push(
-    "// Generated by video2mc — video frames stored in texture atlas.",
-  );
-  lines.push(
-    "// " + fw + "x" + fh + ", " + fps + " fps, " + frameCount + " frames, " + loopDuration.toFixed(2) + "s loop",
-  );
-  lines.push(
-    "// Atlas: " + atlasW + "x" + atlasH + " (" + cols + " cols x " + rows + " rows)",
-  );
+  lines.push("// Generated by video2mc — video embedded as packed RGB float array.");
+  lines.push("// " + width + "x" + height + ", " + fps + " fps, " + frameCount + " frames, " + loopDuration.toFixed(2) + "s loop");
+  lines.push("// Total: " + totalPixels + " pixels (" + ((totalPixels * 4) / 1024).toFixed(0) + " KB SPIR-V constant data)");
   lines.push("");
   lines.push("#include <minecraft:globals.glsl>");
   lines.push("");
-  lines.push("uniform sampler2D iFrameAtlas;");
   if (blendMode !== "replace") {
     lines.push("uniform sampler2D iChan0Sampler;");
     lines.push("#define iChannel0 iChan0Sampler");
+    lines.push("");
   }
-  lines.push("");
   lines.push("layout(location = 0) in vec2 texCoord;");
   lines.push("layout(location = 0) out vec4 fragColor;");
   lines.push("");
 
+  // Emit the packed frame data
+  lines.push("const float FRAME_DATA[" + totalPixels + "] = float[" + totalPixels + "](");
+  for (let i = 0; i < frameData.length; i += 16) {
+    const row = frameData.slice(i, Math.min(i + 16, frameData.length));
+    const comma = i + 16 < frameData.length ? "," : "";
+    lines.push("    " + row.join(", ") + comma);
+  }
+  lines.push(");");
+  lines.push("");
+
   // Constants
-  lines.push("const int FW = " + fw + ";");
-  lines.push("const int FH = " + fh + ";");
-  lines.push("const int COLS = " + cols + ";");
-  lines.push("const int ROWS = " + rows + ";");
+  lines.push("const int FW = " + width + ";");
+  lines.push("const int FH = " + height + ";");
   lines.push("const float FRAME_COUNT = " + frameCount + ".0;");
   lines.push("const float VIDEO_FPS = " + fps + ".0;");
   lines.push("const float LOOP_DUR = " + loopDuration.toFixed(4) + ";");
-  lines.push("const float ATLAS_W = " + atlasW + ".0;");
-  lines.push("const float ATLAS_H = " + atlasH + ".0;");
   lines.push("");
 
+  // Unpack helper
+  lines.push("vec3 unpackRGB(float v) {");
+  lines.push("    float r = floor(v / 65536.0) / 255.0;");
+  lines.push("    float g = floor(mod(v, 65536.0) / 256.0) / 255.0;");
+  lines.push("    float b = mod(v, 256.0) / 255.0;");
+  lines.push("    return vec3(r, g, b);");
+  lines.push("}");
+  lines.push("");
+
+  // Main
   lines.push("void main() {");
   lines.push("    float elapsed = GameTime * " + timeScale.toFixed(4) + ";");
   lines.push("    float videoTime = mod(elapsed, LOOP_DUR);");
   lines.push("    float frameF = floor(videoTime * VIDEO_FPS);");
   lines.push("    frameF = clamp(frameF, 0.0, FRAME_COUNT - 1.0);");
   lines.push("");
+  lines.push("    int px = int(texCoord.x * float(FW));");
+  lines.push("    int py = int(texCoord.y * float(FH));");
+  lines.push("    px = clamp(px, 0, FW - 1);");
+  lines.push("    py = clamp(py, 0, FH - 1);");
+  lines.push("    py = FH - 1 - py; // flip Y");
+  lines.push("");
   lines.push("    int fidx = int(frameF);");
-  // GLSL integer division truncates toward zero for positives, same as floor
-  lines.push("    int col = fidx - (fidx / COLS) * COLS;");
-  lines.push("    int row = fidx / COLS;");
-  lines.push("");
-  // texCoord: (0,0) = screen top-left, (1,1) = screen bottom-right
-  // OpenGL texture: (0,0) = bottom-left, (0,1) = top-left
-  // PNG/atlas: row 0 = top, which OpenGL loads at high V
-  // So we flip Y: screen top (y=0) -> high V (top of frame in atlas)
-  lines.push("    float lu = texCoord.x;");
-  lines.push("    float lv = 1.0 - texCoord.y;");
-  lines.push("");
-  // Map to atlas UV
-  lines.push("    float u = (float(col) + lu) * float(FW) / ATLAS_W;");
-  lines.push("    float v = (float(row) + lv) * float(FH) / ATLAS_H;");
-  lines.push("");
-  lines.push("    vec3 videoColor = texture(iFrameAtlas, vec2(u, v)).rgb;");
+  lines.push("    int offset = fidx * FW * FH;");
+  lines.push("    int idx = offset + py * FW + px;");
+  lines.push("    vec3 videoColor = unpackRGB(FRAME_DATA[idx]);");
   lines.push("");
 
-  // Blend with game render
+  // Blend with game
   if (blendMode === "replace") {
     lines.push("    fragColor = vec4(videoColor, 1.0);");
   } else if (blendMode === "overlay") {
     lines.push("    vec3 sc = texture(iChannel0, texCoord).rgb;");
-    // Standard overlay blend: base < 0.5 ? 2*base*blend : 1 - 2*(1-base)*(1-blend)
+    // Standard overlay: base < 0.5 ? 2*base*blend : 1 - 2*(1-base)*(1-blend)
     lines.push("    vec3 ov = vec3(");
     lines.push("        sc.r < 0.5 ? 2.0 * sc.r * videoColor.r : 1.0 - 2.0 * (1.0 - sc.r) * (1.0 - videoColor.r),");
     lines.push("        sc.g < 0.5 ? 2.0 * sc.g * videoColor.g : 1.0 - 2.0 * (1.0 - sc.g) * (1.0 - videoColor.g),");
@@ -287,24 +246,17 @@ function genShader(opts) {
 
 // ---- Generate post_effect JSON ----
 function genPostEffectJson(effectName, namespace, blendMode) {
-  const inputs = [
-    {
-      sampler_name: "iFrameAtlas",
-      target: namespace + ":post/" + effectName + "_atlas",
-    },
-  ];
+  const inputs = [];
   if (blendMode !== "replace") {
     inputs.push({ sampler_name: "iChan0", target: "minecraft:main" });
   }
   const json = {
-    passes: [
-      {
-        vertex_shader: "minecraft:core/screenquad",
-        fragment_shader: namespace + ":post/" + effectName,
-        inputs: inputs,
-        output: "minecraft:main",
-      },
-    ],
+    passes: [{
+      vertex_shader: "minecraft:core/screenquad",
+      fragment_shader: namespace + ":post/" + effectName,
+      inputs: inputs,
+      output: "minecraft:main",
+    }],
   };
   return JSON.stringify(json, null, 4) + "\n";
 }
@@ -317,7 +269,7 @@ async function main() {
     process.stderr.write(
       "usage: node video2mc.mjs <video> [--out dir] [--name n] [--width 48] [--height auto] " +
       "[--fps 10] [--duration s] [--time-scale 1.0] [--loop s] " +
-      "[--blend replace|overlay|multiply|add] [--smooth] [--dry-run]\n",
+      "[--blend replace|overlay|multiply|add] [--max-pixels 100000] [--dry-run]\n",
     );
     process.exit(1);
   }
@@ -334,8 +286,8 @@ async function main() {
   const maxDuration = args.duration ? Number(args.duration) : null;
   const timeScale = Number(args["time-scale"] || 1.0);
   const dryRun = !!args["dry-run"];
-  const smooth = !!args.smooth;
   const blendMode = args.blend || "replace";
+  const maxPixels = Number(args["max-pixels"] || 100000);
 
   // Get video info
   process.stderr.write("Probing " + videoFile + "... ");
@@ -356,7 +308,7 @@ async function main() {
   const srcDuration = Number(info.format.duration);
   const srcFps = eval(videoStream.r_frame_rate) || 30;
 
-  // Compute target dimensions
+  // Compute initial target dimensions
   let width = targetWidth;
   let height = targetHeight;
   if (height <= 0) {
@@ -367,92 +319,86 @@ async function main() {
 
   const duration = maxDuration ? Math.min(maxDuration, srcDuration) : srcDuration;
   const loopDuration = Number(args.loop) || duration;
-  const frameCount = Math.ceil(duration * fps);
+
+  // Auto-scale to fit SPIR-V constant pool limit
+  const scaled = autoScale(width, height, duration, fps, maxPixels);
+  if (scaled.warnings.length) {
+    for (const w of scaled.warnings) {
+      process.stderr.write("WARNING: " + w + "\n");
+    }
+  }
+
+  const { width: finalW, height: finalH, duration: finalDur, frameCount, totalPixels } = scaled;
 
   process.stderr.write("ok\n");
   process.stderr.write("  Source:   " + srcWidth + "x" + srcHeight + " @ " + srcFps.toFixed(1) + "fps, " + srcDuration.toFixed(1) + "s\n");
-  process.stderr.write("  Target:   " + width + "x" + height + " @ " + fps + " fps, " + duration.toFixed(1) + "s, " + frameCount + " frames\n");
+  process.stderr.write("  Target:   " + finalW + "x" + finalH + " @ " + fps + " fps, " + finalDur.toFixed(1) + "s, " + frameCount + " frames\n");
+  process.stderr.write("  Pixels:   " + totalPixels + " (" + ((totalPixels * 4) / 1024).toFixed(0) + " KB SPIR-V const data, limit " + maxPixels + ")\n");
   process.stderr.write("  Loop:     every " + loopDuration.toFixed(1) + "s (GameTime-scaled)\n");
   process.stderr.write("  Blend:    " + blendMode + "\n");
   process.stderr.write("Extracting frames... ");
 
-  // Extract frames
+  // Extract frames (use final scaled dimensions, and limit duration if needed)
   let raw;
   try {
-    raw = await extractFrames(videoFile, { width, height, fps, duration: maxDuration });
+    raw = await extractFrames(videoFile, { width: finalW, height: finalH, fps, duration: finalDur });
   } catch (e) {
     process.stderr.write("\nerror: ffmpeg failed: " + e.message + "\n");
     process.exit(1);
   }
 
-  const actualFrames = Math.floor(raw.length / (width * height * 3));
+  const actualFrames = Math.floor(raw.length / (finalW * finalH * 3));
   process.stderr.write("ok (" + actualFrames + " frames)\n");
 
-  // Build texture atlas
-  process.stderr.write("Building texture atlas... ");
-  const { atlas, atlasW, atlasH, cols, rows } = buildAtlas(raw, width, height, actualFrames);
-  process.stderr.write("ok (" + atlasW + "x" + atlasH + ", " + cols + " cols x " + rows + " rows)\n");
+  // Pack pixels
+  process.stderr.write("Packing pixels... ");
+  const pixelCount = finalW * finalH * actualFrames;
+  const frameData = new Array(pixelCount);
+  for (let i = 0; i < pixelCount; i++) {
+    const off = i * 3;
+    frameData[i] = packRGB(raw[off], raw[off + 1], raw[off + 2]);
+  }
+  process.stderr.write("ok\n");
 
-  // Encode PNG
-  process.stderr.write("Encoding atlas PNG... ");
-  const pngBuffer = encodePNG(atlasW, atlasH, atlas);
-  process.stderr.write("ok (" + (pngBuffer.length / 1024).toFixed(0) + " KB)\n");
-
-  // Generate shader
+  // Generate
   const effectName = sanitizeName(args.name || path.basename(videoFile, path.extname(videoFile)));
   const shaderSource = genShader({
-    width, height, frameCount: actualFrames, fps,
-    loopDuration, timeScale, blendMode,
-    atlasW, atlasH, cols, rows,
+    width: finalW, height: finalH, frameCount: actualFrames, fps,
+    loopDuration, timeScale, blendMode, frameData,
   });
 
   const postJson = genPostEffectJson(effectName, namespace, blendMode);
 
-  // .mcmeta for filtering (blur:false = GL_NEAREST = crisp pixels)
-  const mcmeta = JSON.stringify({ texture: { blur: !smooth } }, null, 2) + "\n";
-
   const fshPath = "assets/" + namespace + "/shaders/post/" + effectName + ".fsh";
   const jsonPath = "assets/" + namespace + "/post_effect/" + effectName + ".json";
-  const texPath = "assets/" + namespace + "/textures/post/" + effectName + "_atlas.png";
-  const mcmetaPath = texPath + ".mcmeta";
   const outputs = [
-    { path: fshPath, content: shaderSource, size: shaderSource.length, desc: "GLSL shader" },
-    { path: jsonPath, content: postJson, size: postJson.length, desc: "post_effect JSON" },
-    { path: texPath, content: pngBuffer, size: pngBuffer.length, desc: "Atlas texture" },
-    { path: mcmetaPath, content: mcmeta, size: mcmeta.length, desc: "Texture metadata" },
+    { path: fshPath, content: shaderSource, size: shaderSource.length },
+    { path: jsonPath, content: postJson, size: postJson.length },
   ];
 
   // Write
   if (dryRun) {
     console.log("\n[Dry run] Would write " + outputs.length + " files to " + path.resolve(outRoot) + ":");
     for (const o of outputs) {
-      console.log("  " + o.path + "  (" + (o.size / 1024).toFixed(0) + " KB)  " + o.desc);
+      console.log("  " + o.path + "  (" + (o.size / 1024).toFixed(0) + " KB)");
     }
   } else {
     for (const o of outputs) {
       const full = path.join(outRoot, o.path);
       fs.mkdirSync(path.dirname(full), { recursive: true });
-      if (Buffer.isBuffer(o.content)) {
-        fs.writeFileSync(full, o.content);
-      } else {
-        fs.writeFileSync(full, o.content, "utf8");
-      }
+      fs.writeFileSync(full, o.content, "utf8");
     }
   }
 
   // Report
   console.log("\nvideo2mc: \"" + effectName + "\"");
   console.log("  source:  " + videoFile);
-  console.log("  target:  " + width + "x" + height + ", " + fps + " fps, " + actualFrames + " frames, " + loopDuration.toFixed(1) + "s loop");
-  console.log("  atlas:   " + atlasW + "x" + atlasH + " (" + (pngBuffer.length / 1024).toFixed(0) + " KB)");
+  console.log("  target:  " + finalW + "x" + finalH + ", " + fps + " fps, " + actualFrames + " frames, " + loopDuration.toFixed(1) + "s loop");
+  console.log("  pixels:  " + (finalW * finalH * actualFrames) + " (" + ((finalW * finalH * actualFrames * 4) / 1024).toFixed(0) + " KB)");
   console.log("  blend:   " + blendMode);
-  console.log("  filter:  " + (smooth ? "linear (smooth)" : "nearest (crisp)"));
   console.log("  files:");
   for (const o of outputs) {
-    console.log(
-      "    " + (dryRun ? "(dry) " : "") + path.join(outRoot, o.path) +
-      "  (" + (o.size / 1024).toFixed(0) + " KB)  " + o.desc,
-    );
+    console.log("    " + (dryRun ? "(dry) " : "") + path.join(outRoot, o.path) + "  (" + (o.size / 1024).toFixed(0) + " KB)");
   }
   console.log("");
   console.log("  Enable: /post-effect " + effectName);
